@@ -1218,8 +1218,8 @@ TEST_F(HttpTest, progressive_read_timeout_ignores_slow_user_callback) {
 
 TEST_F(HttpTest, progressive_read_timeout_preserves_reader_error) {
     const int port = 8923;
-    brpc::Server server;
     DownloadServiceImpl svc(DONE_BEFORE_CREATE_PA, 10);
+    brpc::Server server;
     ASSERT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
     ASSERT_EQ(0, server.Start(port, NULL));
 
@@ -1238,6 +1238,9 @@ TEST_F(HttpTest, progressive_read_timeout_preserves_reader_error) {
     butil::intrusive_ptr<TimeoutReadBody> reader(
         new TimeoutReadBody(0, EIO));
     cntl.ReadProgressiveAttachmentBy(reader.get());
+    for (int i = 0; i < 100 && reader->end_count() == 0; ++i) {
+        bthread_usleep(10000);
+    }
     ASSERT_EQ(1, reader->end_count());
     EXPECT_EQ(EIO, reader->end_error());
 }
