@@ -15,14 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <stdlib.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <string>
 #include <vector>
 
 #include <gflags/gflags.h>
@@ -57,6 +60,10 @@ butil::atomic<int64_t> g_latency_sum(0);
 butil::atomic<int64_t> g_success_count(0);
 butil::atomic<int64_t> g_min_latency_us(
     std::numeric_limits<int64_t>::max());
+butil::atomic<int64_t> g_server_cpu_sum_milli_percent(0);
+butil::atomic<int64_t> g_server_cpu_samples(0);
+butil::atomic<int64_t> g_client_cpu_sum_milli_percent(0);
+butil::atomic<int64_t> g_client_cpu_samples(0);
 butil::atomic<bool> g_stop(false);
 
 namespace brpc {
@@ -79,6 +86,46 @@ static void record_latency(int64_t latency_us) {
     while (latency_us < old_min &&
            !g_min_latency_us.compare_exchange_weak(
                old_min, latency_us, butil::memory_order_relaxed)) {
+    }
+}
+
+static bool parse_cpu_percent(const std::string& value,
+                              int64_t* milli_percent) {
+    if (value.empty()) {
+        return false;
+    }
+    errno = 0;
+    char* end = nullptr;
+    const double ratio = std::strtod(value.c_str(), &end);
+    if (errno != 0 || end == value.c_str() || *end != '\0' ||
+        !std::isfinite(ratio) || ratio < 0) {
+        return false;
+    }
+    const double scaled = ratio * 100000.0;
+    if (scaled > static_cast<double>(std::numeric_limits<int64_t>::max())) {
+        return false;
+    }
+    *milli_percent = static_cast<int64_t>(std::llround(scaled));
+    return true;
+}
+
+static void record_server_cpu(const std::string& value) {
+    int64_t milli_percent = 0;
+    if (parse_cpu_percent(value, &milli_percent)) {
+        g_server_cpu_sum_milli_percent.fetch_add(
+            milli_percent, butil::memory_order_relaxed);
+        g_server_cpu_samples.fetch_add(1, butil::memory_order_relaxed);
+    }
+}
+
+static void record_client_cpu() {
+    int64_t milli_percent = 0;
+    if (parse_cpu_percent(
+            bvar::Variable::describe_exposed("process_cpu_usage"),
+            &milli_percent)) {
+        g_client_cpu_sum_milli_percent.fetch_add(
+            milli_percent, butil::memory_order_relaxed);
+        g_client_cpu_samples.fetch_add(1, butil::memory_order_relaxed);
     }
 }
 
@@ -119,6 +166,7 @@ static void* worker(void* arg) {
                     << "RPC failed: " << cntls[i].ErrorText();
             } else {
                 record_latency(cntls[i].latency_us());
+                record_server_cpu(resps[i].cpu_usage());
             }
         }
         if (qps > 0 && issued > 0) {
@@ -210,6 +258,7 @@ int main(int argc, char* argv[]) {
             bthread_usleep(static_cast<uint64_t>(
                 std::min<int64_t>(remaining_us, 1000000)));
         }
+        record_client_cpu();
         LOG(INFO) << "rps=" << g_latency->qps(1)
                   << " avg=" << g_latency->latency(1) << "us"
                   << " errors=" << g_error_count.get_value();
@@ -228,6 +277,27 @@ int main(int argc, char* argv[]) {
                                     butil::memory_order_relaxed)) / requests
                               : 0;
     const double rps = elapsed_seconds > 0 ? requests / elapsed_seconds : 0;
+    const double throughput_mb_s =
+        elapsed_seconds > 0 && FLAGS_attachment_size > 0
+            ? requests * static_cast<double>(FLAGS_attachment_size) /
+                  elapsed_seconds / 1000000.0
+            : 0;
+    const int64_t server_cpu_samples =
+        g_server_cpu_samples.load(butil::memory_order_relaxed);
+    const int64_t client_cpu_samples =
+        g_client_cpu_samples.load(butil::memory_order_relaxed);
+    const double server_cpu_percent =
+        server_cpu_samples > 0
+            ? g_server_cpu_sum_milli_percent.load(
+                  butil::memory_order_relaxed) /
+                  (1000.0 * server_cpu_samples)
+            : 0;
+    const double client_cpu_percent =
+        client_cpu_samples > 0
+            ? g_client_cpu_sum_milli_percent.load(
+                  butil::memory_order_relaxed) /
+                  (1000.0 * client_cpu_samples)
+            : 0;
 
     // LatencyRecorder samples once per second. Allow the final partial second
     // to be sampled before reading whole-run percentiles and maximum latency.
@@ -241,6 +311,7 @@ int main(int argc, char* argv[]) {
               << " polling=" << (brpc::urma::FLAGS_urma_use_polling
                                        ? "true" : "false")
               << " payload=" << FLAGS_attachment_size
+              << " thread_num=" << thread_num
               << " avg_us=" << avg_us
               << " min_us=" << min_us
               << " p50_us=" << g_latency->latency_percentile(0.50)
@@ -249,8 +320,13 @@ int main(int argc, char* argv[]) {
               << " p999_us=" << g_latency->latency_percentile(0.999)
               << " max_us=" << g_latency->max_latency()
               << " rps=" << rps
+              << " server_cpu_percent=" << server_cpu_percent
+              << " client_cpu_percent=" << client_cpu_percent
+              << " throughput_mb_s=" << throughput_mb_s
               << " requests=" << requests
-              << " errors=" << g_error_count.get_value() << std::endl;
+              << " errors=" << g_error_count.get_value()
+              << " server_cpu_samples=" << server_cpu_samples
+              << " client_cpu_samples=" << client_cpu_samples << std::endl;
     return 0;
 }
 
