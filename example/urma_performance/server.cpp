@@ -30,6 +30,8 @@
 
 DEFINE_int32(port, 8003, "TCP Port of this server");
 DEFINE_bool(use_urma, true, "Use URMA transport (true) or TCP (false)");
+DEFINE_int32(server_thread_num, 16,
+             "Number of bthread worker pthreads used by the server");
 
 butil::atomic<uint64_t> g_last_time(0);
 
@@ -64,6 +66,10 @@ public:
 
 int main(int argc, char* argv[]) {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
+    if (FLAGS_server_thread_num <= 0) {
+        LOG(ERROR) << "server_thread_num must be positive";
+        return -1;
+    }
     brpc::Server server;
     test::PerfTestServiceImpl service;
 
@@ -73,6 +79,7 @@ int main(int argc, char* argv[]) {
     }
 
     brpc::ServerOptions options;
+    options.num_threads = FLAGS_server_thread_num;
     options.socket_mode = FLAGS_use_urma ? brpc::SOCKET_MODE_URMA
                                           : brpc::SOCKET_MODE_TCP;
     if (server.Start(FLAGS_port, &options) != 0) {
@@ -80,7 +87,8 @@ int main(int argc, char* argv[]) {
         return -1;
     }
     LOG(INFO) << "URMA performance server started on port " << FLAGS_port
-              << " (use_urma=" << FLAGS_use_urma << ")";
+              << " (use_urma=" << FLAGS_use_urma
+              << ", server_thread_num=" << FLAGS_server_thread_num << ")";
     server.RunUntilAskedToQuit();
     return 0;
 }
