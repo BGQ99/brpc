@@ -37,6 +37,7 @@
 #include "butil/time.h"
 #include "brpc/channel.h"
 #include "brpc/controller.h"
+#include "brpc/urma/urma_helper.h"
 #include "bthread/bthread.h"
 #include "bvar/latency_recorder.h"
 #include "bvar/variable.h"
@@ -309,6 +310,9 @@ int main(int argc, char* argv[]) {
     if (thread_num <= 0 || FLAGS_queue_depth <= 0) {
         LOG(ERROR) << "thread_num and queue_depth must be positive";
         return -1;
+    }
+    if (FLAGS_use_urma) {
+        brpc::urma::GlobalUrmaInitializeOrDie();
     }
     bvar::LatencyRecorder latency("client", stats_window_seconds);
     g_latency = &latency;
