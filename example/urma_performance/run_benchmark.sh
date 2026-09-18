@@ -27,6 +27,7 @@ URMA_POLL_SERVER="127.0.0.1:8005"
 MODE="all"
 TEST_SECONDS=30
 REPEATS=3
+CLIENT_PROCESS_NUM=1
 OUTPUT_DIR="${SCRIPT_DIR}/benchmark-results/$(date +%Y%m%d-%H%M%S)"
 PAYLOAD_SIZES=(16 64 256 1024 4096 8192 102400 204800 1048576 8388608)
 THREAD_NUMS=(1 4 8)
@@ -46,6 +47,8 @@ usage() {
     echo "  --mode MODE            tcp, urma_event, urma_poll, or all (default: ${MODE})"
     echo "  --test-seconds N       Duration of each run (default: ${TEST_SECONDS})"
     echo "  --repeats N            Repetitions per configuration (default: ${REPEATS})"
+    echo "  --client-process-num N Concurrent client processes per run"
+    echo "                         (default: ${CLIENT_PROCESS_NUM})"
     echo "  --payload-sizes LIST   Comma-separated byte sizes"
     echo "                         (default: ${PAYLOAD_SIZES[*]})"
     echo "  --thread-nums LIST     Comma-separated client concurrency values"
@@ -111,6 +114,11 @@ while (($# > 0)); do
             REPEATS=$2
             shift 2
             ;;
+        --client-process-num)
+            (($# >= 2)) || { echo "ERROR: --client-process-num requires a value" >&2; exit 2; }
+            CLIENT_PROCESS_NUM=$2
+            shift 2
+            ;;
         --payload-sizes)
             (($# >= 2)) || { echo "ERROR: --payload-sizes requires a value" >&2; exit 2; }
             require_positive_integer_list "--payload-sizes" "$2"
@@ -153,6 +161,7 @@ done
 
 require_positive_integer "--test-seconds" "${TEST_SECONDS}"
 require_positive_integer "--repeats" "${REPEATS}"
+require_positive_integer "--client-process-num" "${CLIENT_PROCESS_NUM}"
 case "${MODE}" in
     tcp|urma_event|urma_poll|all) ;;
     *)
@@ -185,6 +194,23 @@ MODE_SERVERS=("${TCP_SERVER}" "${URMA_EVENT_SERVER}" "${URMA_POLL_SERVER}")
 MODE_USE_URMA=(false true true)
 MODE_POLLING=(false false true)
 failures=0
+pids=()
+
+terminate_active_clients() {
+    trap - INT TERM
+    local pid
+    for pid in "${pids[@]}"; do
+        if kill -0 "${pid}" 2>/dev/null; then
+            kill "${pid}" 2>/dev/null || true
+        fi
+    done
+    for pid in "${pids[@]}"; do
+        wait "${pid}" 2>/dev/null || true
+    done
+    exit 130
+}
+
+trap terminate_active_clients INT TERM
 
 for mode_index in "${!MODE_NAMES[@]}"; do
     mode=${MODE_NAMES[mode_index]}
@@ -196,13 +222,12 @@ for mode_index in "${!MODE_NAMES[@]}"; do
     polling=${MODE_POLLING[mode_index]}
     csv_file="${OUTPUT_DIR}/results_${mode}.csv"
     summary_file="${OUTPUT_DIR}/summary_${mode}.csv"
-    echo "run,mode,server,transport,polling,io_size_byte,client_process_num,queue_depth,qps,avg_latency_us,min_latency_us,p50_latency_us,p90_latency_us,p99_latency_us,p999_latency_us,max_latency_us,server_cpu_percent,client_cpu_percent,throughput_mb_s,requests,errors,server_cpu_samples,client_cpu_samples,status" > "${csv_file}"
+    echo "run,mode,server,transport,polling,io_size_byte,client_process_num,client_thread_num,queue_depth,qps,avg_latency_us,min_latency_us,p50_latency_us,p90_latency_us,p99_latency_us,p999_latency_us,max_latency_us,server_cpu_percent,client_cpu_percent,throughput_mb_s,requests,errors,server_cpu_samples,client_cpu_samples,status" > "${csv_file}"
 
     for payload in "${PAYLOAD_SIZES[@]}"; do
         for thread_num in "${THREAD_NUMS[@]}"; do
             for queue_depth in "${QUEUE_DEPTHS[@]}"; do
                 for ((run = 1; run <= REPEATS; ++run)); do
-                    log_file="${OUTPUT_DIR}/${mode}_payload-${payload}_threads-${thread_num}_queue-depth-${queue_depth}_run-${run}.log"
                     command=(
                         "${CLIENT_BIN}"
                         "--server=${server}"
@@ -215,18 +240,43 @@ for mode_index in "${!MODE_NAMES[@]}"; do
                         "${EXTRA_ARGS[@]}"
                     )
 
-                    echo "Running mode=${mode} server=${server} payload=${payload} threads=${thread_num} queue_depth=${queue_depth} run=${run}/${REPEATS}"
-                    "${command[@]}" 2>&1 | tee "${log_file}"
-                    client_status=${PIPESTATUS[0]}
+                    echo "Running mode=${mode} server=${server} payload=${payload} processes=${CLIENT_PROCESS_NUM} threads_per_process=${thread_num} queue_depth=${queue_depth} run=${run}/${REPEATS}"
+                    pids=()
+                    process_logs=()
+                    for ((process_index = 1; process_index <= CLIENT_PROCESS_NUM; ++process_index)); do
+                        log_file="${OUTPUT_DIR}/${mode}_payload-${payload}_processes-${CLIENT_PROCESS_NUM}_threads-${thread_num}_queue-depth-${queue_depth}_run-${run}_process-${process_index}.log"
+                        process_logs+=("${log_file}")
+                        "${command[@]}" > "${log_file}" 2>&1 &
+                        pids+=("$!")
+                    done
 
-                    result_count=$(grep -c '^RESULT ' "${log_file}" || true)
-                    if ((client_status != 0 || result_count != 1)); then
-                        echo "ERROR: mode=${mode} server=${server} payload=${payload} threads=${thread_num} queue_depth=${queue_depth} run=${run} status=${client_status} RESULT_lines=${result_count}" >&2
+                    process_failed=0
+                    result_lines=()
+                    for process_index in "${!pids[@]}"; do
+                        client_status=0
+                        wait "${pids[process_index]}" || client_status=$?
+                        log_file=${process_logs[process_index]}
+                        result_count=$(grep -c '^RESULT ' "${log_file}" || true)
+                        if ((client_status != 0 || result_count != 1)); then
+                            echo "ERROR: mode=${mode} server=${server} payload=${payload} processes=${CLIENT_PROCESS_NUM} threads_per_process=${thread_num} queue_depth=${queue_depth} run=${run} process=$((process_index + 1)) status=${client_status} RESULT_lines=${result_count}; inspect ${log_file}" >&2
+                            process_failed=1
+                            continue
+                        fi
+                        result_lines+=("$(grep '^RESULT ' "${log_file}")")
+                    done
+                    pids=()
+                    if ((process_failed != 0)); then
                         ((failures += 1))
                         continue
                     fi
 
-                    result_row=$(grep '^RESULT ' "${log_file}" | awk -v run="${run}" -v mode="${mode}" -v server="${server}" -v queue_depth="${queue_depth}" '
+                    result_row=$(printf '%s\n' "${result_lines[@]}" | awk \
+                        -v run="${run}" \
+                        -v mode="${mode}" \
+                        -v server="${server}" \
+                        -v client_process_num="${CLIENT_PROCESS_NUM}" \
+                        -v expected_thread_num="${thread_num}" \
+                        -v queue_depth="${queue_depth}" '
                     BEGIN { OFS = "," }
                     {
                         delete value
@@ -234,25 +284,70 @@ for mode_index in "${!MODE_NAMES[@]}"; do
                             split($i, field, "=")
                             value[field[1]] = field[2]
                         }
-                        status = (value["errors"] == 0 &&
-                                  value["server_cpu_samples"] > 0 &&
-                                  value["client_cpu_samples"] > 0) ? "ok" : "failed"
-                        print run, mode, server, value["transport"], value["polling"],
-                              value["payload"], value["thread_num"], queue_depth,
-                              value["rps"],
-                              value["avg_us"], value["min_us"], value["p50_us"],
-                              value["p90_us"], value["p99_us"], value["p999_us"],
-                              value["max_us"], value["server_cpu_percent"],
-                              value["client_cpu_percent"], value["throughput_mb_s"],
-                              value["requests"], value["errors"],
-                              value["server_cpu_samples"], value["client_cpu_samples"],
-                              status
+                        if (record_count == 0) {
+                            transport = value["transport"]
+                            polling = value["polling"]
+                            payload = value["payload"]
+                            client_thread_num = value["thread_num"]
+                            min_latency = value["min_us"] + 0
+                            max_latency = value["max_us"] + 0
+                        } else if (transport != value["transport"] ||
+                                   polling != value["polling"] ||
+                                   payload != value["payload"] ||
+                                   client_thread_num != value["thread_num"]) {
+                            inconsistent = 1
+                        }
+                        requests = value["requests"] + 0
+                        server_samples = value["server_cpu_samples"] + 0
+                        total_qps += value["rps"] + 0
+                        total_throughput += value["throughput_mb_s"] + 0
+                        total_requests += requests
+                        total_errors += value["errors"] + 0
+                        weighted_latency += (value["avg_us"] + 0) * requests
+                        percentile_50 += value["p50_us"] + 0
+                        percentile_90 += value["p90_us"] + 0
+                        percentile_99 += value["p99_us"] + 0
+                        percentile_999 += value["p999_us"] + 0
+                        if ((value["min_us"] + 0) < min_latency) {
+                            min_latency = value["min_us"] + 0
+                        }
+                        if ((value["max_us"] + 0) > max_latency) {
+                            max_latency = value["max_us"] + 0
+                        }
+                        weighted_server_cpu += (value["server_cpu_percent"] + 0) * server_samples
+                        total_server_samples += server_samples
+                        total_client_cpu += value["client_cpu_percent"] + 0
+                        total_client_samples += value["client_cpu_samples"] + 0
+                        ++record_count
+                    }
+                    END {
+                        avg_latency = total_requests > 0 ? weighted_latency / total_requests : 0
+                        avg_server_cpu = total_server_samples > 0 ? weighted_server_cpu / total_server_samples : 0
+                        avg_client_cpu = record_count > 0 ? total_client_cpu / record_count : 0
+                        status = (record_count == client_process_num &&
+                                  !inconsistent &&
+                                  client_thread_num == expected_thread_num &&
+                                  total_errors == 0 &&
+                                  total_server_samples > 0 &&
+                                  total_client_samples > 0) ? "ok" : "failed"
+                        print run, mode, server, transport, polling,
+                              payload, client_process_num, client_thread_num,
+                              queue_depth, total_qps, avg_latency, min_latency,
+                              percentile_50 / record_count,
+                              percentile_90 / record_count,
+                              percentile_99 / record_count,
+                              percentile_999 / record_count,
+                              max_latency, avg_server_cpu, avg_client_cpu,
+                              total_throughput, total_requests, total_errors,
+                              total_server_samples, total_client_samples, status
                     }
                     ')
                     echo "${result_row}" >> "${csv_file}"
                     if [[ ${result_row##*,} != ok ]]; then
-                        echo "ERROR: invalid metrics for mode=${mode} payload=${payload} threads=${thread_num} queue_depth=${queue_depth} run=${run}; check errors and CPU sample counts" >&2
+                        echo "ERROR: invalid aggregated metrics for mode=${mode} payload=${payload} processes=${CLIENT_PROCESS_NUM} threads_per_process=${thread_num} queue_depth=${queue_depth} run=${run}; check errors and CPU sample counts" >&2
                         ((failures += 1))
+                    else
+                        echo "Aggregated result: ${result_row}"
                     fi
                 done
             done
@@ -262,29 +357,30 @@ for mode_index in "${!MODE_NAMES[@]}"; do
     awk -F, -v expected_repeats="${REPEATS}" '
         BEGIN {
             OFS = ","
-            print "io_size_byte", "client_process_num", "queue_depth", \
-                  "protocol", "qps", \
+            print "io_size_byte", "client_process_num", "client_thread_num", \
+                  "queue_depth", "protocol", "qps", \
                   "avg_latency_us", "p99_latency_us", "server_cpu_percent", \
                   "client_cpu_percent", "throughput_mb_s", "successful_repeats"
         }
-        NR == 1 || $24 != "ok" { next }
+        NR == 1 || $25 != "ok" { next }
         {
-            key = $6 SUBSEP $7 SUBSEP $8
+            key = $6 SUBSEP $7 SUBSEP $8 SUBSEP $9
             if (!(key in seen)) {
                 seen[key] = 1
                 order[++group_count] = key
                 payload[key] = $6
-                threads[key] = $7
-                queue_depth[key] = $8
+                processes[key] = $7
+                threads[key] = $8
+                queue_depth[key] = $9
                 protocol[key] = $2
             }
             count[key]++
-            qps[key, count[key]] = $9
-            avg[key, count[key]] = $10
-            p99[key, count[key]] = $14
-            server_cpu[key, count[key]] = $17
-            client_cpu[key, count[key]] = $18
-            throughput[key, count[key]] = $19
+            qps[key, count[key]] = $10
+            avg[key, count[key]] = $11
+            p99[key, count[key]] = $15
+            server_cpu[key, count[key]] = $18
+            client_cpu[key, count[key]] = $19
+            throughput[key, count[key]] = $20
         }
         function median(metric, key, n, values, i, j, tmp) {
             delete values
@@ -312,8 +408,8 @@ for mode_index in "${!MODE_NAMES[@]}"; do
                 if (n != expected_repeats) {
                     continue
                 }
-                printf "%s,%s,%s,%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d\n", \
-                       payload[key], threads[key], queue_depth[key], \
+                printf "%s,%s,%s,%s,%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d\n", \
+                       payload[key], processes[key], threads[key], queue_depth[key], \
                        protocol[key], \
                        median(qps, key, n), median(avg, key, n), \
                        median(p99, key, n), median(server_cpu, key, n), \
@@ -339,7 +435,8 @@ if [[ -f ${tcp_summary} && -f ${event_summary} && -f ${poll_summary} ]]; then
     awk -F, -v tcp_file="${tcp_summary}" '
         BEGIN {
             OFS = ","
-            print "io_size(Byte)", "client_process_num", "queue_depth", \
+            print "io_size(Byte)", "client_process_num", "client_thread_num", \
+                  "queue_depth", \
                   "TCP QPS(sum)", "TCP avg_latency_us", "TCP p99_latency_us", \
                   "TCP server_cpu_percent", "TCP client_cpu_percent", "TCP throughput_MB/s", \
                   "URMA Event QPS(sum)", "URMA Event avg_latency_us", "URMA Event p99_latency_us", \
@@ -349,20 +446,21 @@ if [[ -f ${tcp_summary} && -f ${event_summary} && -f ${poll_summary} ]]; then
         }
         FNR == 1 { next }
         {
-            key = $1 SUBSEP $2 SUBSEP $3
-            mode = $4
-            data[key, mode] = $5 OFS $6 OFS $7 OFS $8 OFS $9 OFS $10
+            key = $1 SUBSEP $2 SUBSEP $3 SUBSEP $4
+            mode = $5
+            data[key, mode] = $6 OFS $7 OFS $8 OFS $9 OFS $10 OFS $11
             if (FILENAME == tcp_file) {
                 order[++row_count] = key
                 payload[key] = $1
-                threads[key] = $2
-                queue_depth[key] = $3
+                processes[key] = $2
+                threads[key] = $3
+                queue_depth[key] = $4
             }
         }
         END {
             for (i = 1; i <= row_count; ++i) {
                 key = order[i]
-                print payload[key], threads[key], queue_depth[key], \
+                print payload[key], processes[key], threads[key], queue_depth[key], \
                       data[key, "tcp"], \
                       data[key, "urma_event"], data[key, "urma_poll"]
             }
