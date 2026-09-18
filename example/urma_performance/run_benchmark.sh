@@ -24,6 +24,7 @@ CLIENT_BIN="${SCRIPT_DIR}/build/urma_performance_client"
 TCP_SERVER="127.0.0.1:8003"
 URMA_EVENT_SERVER="127.0.0.1:8004"
 URMA_POLL_SERVER="127.0.0.1:8005"
+URMA_POLL_SERVERS=()
 MODE="all"
 TEST_SECONDS=30
 REPEATS=3
@@ -44,6 +45,8 @@ usage() {
     echo "                         URMA Event server (default: ${URMA_EVENT_SERVER})"
     echo "  --urma-poll-server ADDRESS"
     echo "                         URMA Poll server (default: ${URMA_POLL_SERVER})"
+    echo "  --urma-poll-servers LIST"
+    echo "                         Comma-separated URMA Poll servers; one per client process"
     echo "  --mode MODE            tcp, urma_event, urma_poll, or all (default: ${MODE})"
     echo "  --test-seconds N       Duration of each run (default: ${TEST_SECONDS})"
     echo "  --repeats N            Repetitions per configuration (default: ${REPEATS})"
@@ -97,6 +100,15 @@ while (($# > 0)); do
         --urma-poll-server)
             (($# >= 2)) || { echo "ERROR: --urma-poll-server requires a value" >&2; exit 2; }
             URMA_POLL_SERVER=$2
+            shift 2
+            ;;
+        --urma-poll-servers)
+            (($# >= 2)) || { echo "ERROR: --urma-poll-servers requires a value" >&2; exit 2; }
+            if [[ ! $2 =~ ^[^,]+(,[^,]+)*$ ]]; then
+                echo "ERROR: --urma-poll-servers must be a comma-separated list of non-empty addresses: $2" >&2
+                exit 2
+            fi
+            IFS=',' read -r -a URMA_POLL_SERVERS <<< "$2"
             shift 2
             ;;
         --mode)
@@ -162,6 +174,18 @@ done
 require_positive_integer "--test-seconds" "${TEST_SECONDS}"
 require_positive_integer "--repeats" "${REPEATS}"
 require_positive_integer "--client-process-num" "${CLIENT_PROCESS_NUM}"
+if ((${#URMA_POLL_SERVERS[@]} > 0)); then
+    if ((${#URMA_POLL_SERVERS[@]} != CLIENT_PROCESS_NUM)); then
+        echo "ERROR: --urma-poll-servers must contain exactly ${CLIENT_PROCESS_NUM} addresses, one per client process" >&2
+        exit 2
+    fi
+    for server in "${URMA_POLL_SERVERS[@]}"; do
+        if [[ -z ${server} || ${server} == *,* ]]; then
+            echo "ERROR: --urma-poll-servers contains an empty or invalid address" >&2
+            exit 2
+        fi
+    done
+fi
 case "${MODE}" in
     tcp|urma_event|urma_poll|all) ;;
     *)
@@ -218,6 +242,12 @@ for mode_index in "${!MODE_NAMES[@]}"; do
         continue
     fi
     server=${MODE_SERVERS[mode_index]}
+    mode_servers=("${server}")
+    if [[ ${mode} == urma_poll && ${#URMA_POLL_SERVERS[@]} -gt 0 ]]; then
+        mode_servers=("${URMA_POLL_SERVERS[@]}")
+        printf -v server '%s+' "${mode_servers[@]}"
+        server=${server%+}
+    fi
     use_urma=${MODE_USE_URMA[mode_index]}
     polling=${MODE_POLLING[mode_index]}
     csv_file="${OUTPUT_DIR}/results_${mode}.csv"
@@ -228,22 +258,25 @@ for mode_index in "${!MODE_NAMES[@]}"; do
         for thread_num in "${THREAD_NUMS[@]}"; do
             for queue_depth in "${QUEUE_DEPTHS[@]}"; do
                 for ((run = 1; run <= REPEATS; ++run)); do
-                    command=(
-                        "${CLIENT_BIN}"
-                        "--server=${server}"
-                        "--test_seconds=${TEST_SECONDS}"
-                        "--attachment_size=${payload}"
-                        "--thread_num=${thread_num}"
-                        "--queue_depth=${queue_depth}"
-                        "--use_urma=${use_urma}"
-                        "--urma_use_polling=${polling}"
-                        "${EXTRA_ARGS[@]}"
-                    )
-
                     echo "Running mode=${mode} server=${server} payload=${payload} processes=${CLIENT_PROCESS_NUM} threads_per_process=${thread_num} queue_depth=${queue_depth} run=${run}/${REPEATS}"
                     pids=()
                     process_logs=()
                     for ((process_index = 1; process_index <= CLIENT_PROCESS_NUM; ++process_index)); do
+                        process_server=${mode_servers[0]}
+                        if ((${#mode_servers[@]} > 1)); then
+                            process_server=${mode_servers[process_index - 1]}
+                        fi
+                        command=(
+                            "${CLIENT_BIN}"
+                            "--server=${process_server}"
+                            "--test_seconds=${TEST_SECONDS}"
+                            "--attachment_size=${payload}"
+                            "--thread_num=${thread_num}"
+                            "--queue_depth=${queue_depth}"
+                            "--use_urma=${use_urma}"
+                            "--urma_use_polling=${polling}"
+                            "${EXTRA_ARGS[@]}"
+                        )
                         log_file="${OUTPUT_DIR}/${mode}_payload-${payload}_processes-${CLIENT_PROCESS_NUM}_threads-${thread_num}_queue-depth-${queue_depth}_run-${run}_process-${process_index}.log"
                         process_logs+=("${log_file}")
                         "${command[@]}" > "${log_file}" 2>&1 &
@@ -258,7 +291,11 @@ for mode_index in "${!MODE_NAMES[@]}"; do
                         log_file=${process_logs[process_index]}
                         result_count=$(grep -c '^RESULT ' "${log_file}" || true)
                         if ((client_status != 0 || result_count != 1)); then
-                            echo "ERROR: mode=${mode} server=${server} payload=${payload} processes=${CLIENT_PROCESS_NUM} threads_per_process=${thread_num} queue_depth=${queue_depth} run=${run} process=$((process_index + 1)) status=${client_status} RESULT_lines=${result_count}; inspect ${log_file}" >&2
+                            process_server=${mode_servers[0]}
+                            if ((${#mode_servers[@]} > 1)); then
+                                process_server=${mode_servers[process_index]}
+                            fi
+                            echo "ERROR: mode=${mode} server=${process_server} payload=${payload} processes=${CLIENT_PROCESS_NUM} threads_per_process=${thread_num} queue_depth=${queue_depth} run=${run} process=$((process_index + 1)) status=${client_status} RESULT_lines=${result_count}; inspect ${log_file}" >&2
                             process_failed=1
                             continue
                         fi
