@@ -119,12 +119,15 @@ trap cleanup EXIT
     fi
 } >"${result_dir}/metadata.txt"
 
-run_with_cpuset "${server_cpuset}" "${server_bin}" \
+server_command=("${server_bin}" \
     --port="${server_port}" \
     --use_ubring=true \
     --ub_shm_type=1 \
-    --ub_trace_verbose=true \
-    >"${result_dir}/server.log" 2>&1 &
+    --ub_trace_verbose=true)
+if [[ -n "${server_cpuset}" ]]; then
+    server_command=(taskset -c "${server_cpuset}" "${server_command[@]}")
+fi
+"${server_command[@]}" >"${result_dir}/server.log" 2>&1 &
 server_pid=$!
 
 sleep "${startup_seconds}"
