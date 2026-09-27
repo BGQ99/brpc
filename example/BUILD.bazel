@@ -154,6 +154,17 @@ cc_binary(
 )
 
 cc_binary(
+    name = "ipc_v2_microbenchmark",
+    srcs = [
+        "ubring_performance/ipc_v2_microbenchmark.cpp",
+    ],
+    copts = COPTS,
+    deps = [
+        "//:brpc",
+    ],
+)
+
+cc_binary(
     name = "redis_c++_server",
     srcs = [
         "redis_c++/redis_server.cpp",

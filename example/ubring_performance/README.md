@@ -102,3 +102,38 @@ example/ubring_performance/run_benchmark.sh
 For IPC_V2 experiments, a format ID must still describe one fixed layout in a
 given build. Use separate, matching client/server builds for 4 KiB and 8 KiB
 candidates, and identify the build and Git commit through `LABEL` and metadata.
+
+## IPC_V2 candidate microbenchmark
+
+The experimental microbenchmark exercises the standalone single-producer,
+single-consumer Tx/Rx views directly. It does not use RPC, handshake, poller,
+or the production UBRing data path. Use it to compare candidate layouts before
+freezing an IPC_V2 format.
+
+Build with Bazel:
+
+```bash
+bazel build --config=ubring //example:ipc_v2_microbenchmark
+```
+
+Run one candidate:
+
+```bash
+bazel-bin/example/ipc_v2_microbenchmark \
+  --slot_size=4096 \
+  --payload_offset=64 \
+  --message_size=4096 \
+  --ring_bytes=$((64 * 1024 * 1024)) \
+  --warmup_iterations=10000 \
+  --iterations=100000
+```
+
+`slot_size` accepts 1024, 4096, or 8192 bytes. `payload_offset` accepts 16
+bytes (compact metadata) or 64 bytes (separated metadata). The output reports
+the actual capacity, measured bytes, operations per second, and GiB/s.
+
+Run each candidate with the same ring byte budget, message size, warm-up, and
+iteration count. Repeat each case several times, keep the raw output, and use
+`taskset` on the benchmark host when comparing CPU placement. This benchmark
+only selects an algorithm/layout candidate; it does not validate cross-process
+mapping or end-to-end RPC behavior.

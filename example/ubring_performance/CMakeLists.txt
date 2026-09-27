@@ -38,3 +38,11 @@ target_link_libraries(ubring_performance_client PRIVATE
     ${BRPC_LIB} ${DYNAMIC_LIB})
 target_link_libraries(ubring_performance_server PRIVATE
     ${BRPC_LIB} ${DYNAMIC_LIB})
+
+add_executable(ipc_v2_microbenchmark ipc_v2_microbenchmark.cpp)
+target_include_directories(ipc_v2_microbenchmark PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/../../src)
+target_compile_features(ipc_v2_microbenchmark PRIVATE cxx_std_11)
+target_compile_options(ipc_v2_microbenchmark PRIVATE
+    -O2 -pipe -Wall -Wextra -fno-omit-frame-pointer)
+target_link_libraries(ipc_v2_microbenchmark PRIVATE Threads::Threads)
